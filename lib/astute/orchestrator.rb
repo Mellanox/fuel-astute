@@ -46,6 +46,10 @@ module Astute
 
       # Post deploy hooks
       upload_cirros_image(deployment_info, context)
+      if use_mellanox?(deployment_info)
+        upload_cirros_image(deployment_info, context, use_mellanox=true)
+        validate_linuxbridge_l3(deployment_info, context)
+      end
       update_cluster_hosts_info(deployment_info, context)
       restart_radosgw(deployment_info, context)
 
@@ -306,7 +310,42 @@ module Astute
       Astute.logger.info "#{context.task_id}: Finish restarting radosgw on controller nodes"
     end
 
-    def upload_cirros_image(deployment_info, context)
+    def validate_linuxbridge_l3(deployment_info, context)
+      controller = get_controller(deployment_info)
+      return if controller.nil?
+
+      puppet_modules_dir = "/etc/puppet/modules"
+      linuxbridge_l3_puppet_manifest = "#{puppet_modules_dir}/mellanox_neutron_fuel/manifests/network_node_l3.pp"
+      l3_puppet_hook_cmd = "puppet apply #{linuxbridge_l3_puppet_manifest}"
+      response = run_shell_command(context, Array(controller['uid']), l3_puppet_hook_cmd)
+      if response[:data][:exit_code] == 0
+        Astute.logger.info("#{context.task_id}: fixed neutron l3 agent with linuxbridge")
+      else
+        msg = 'Failed to fix l3 agent with linuxbridge'
+        raise msg
+      end
+    end
+
+    def use_mellanox?(deployment_info)
+      controller = get_controller(deployment_info)
+      return if controller.nil?
+
+      use_mellanox=(controller['neutron-mellanox']['enabled'] != 'disabled')
+      Astute.logger.info("Using mellanox image - #{use_mellanox}")
+
+      use_mellanox
+    end
+
+    def get_controller(deployment_info)
+      controller = deployment_info.find { |n| n['role'] == 'primary-controller' }
+      controller = deployment_info.find { |n| n['role'] == 'controller' } unless controller
+      if controller.nil?
+        Astute.logger.debug("Could not find controller! Possible adding a new node to the existing cluster?")
+      end
+      controller
+    end
+
+    def upload_cirros_image(deployment_info, context, use_mellanox=false)
       #FIXME: update context status to multirole support: possible situation where one of the
       #       roles of node fail but if last status - success, we try to run code below.
       if context.status.has_value?('error')
@@ -314,12 +353,8 @@ module Astute
         return
       end
 
-      controller = deployment_info.find { |n| n['role'] == 'primary-controller' }
-      controller = deployment_info.find { |n| n['role'] == 'controller' } unless controller
-      if controller.nil?
-        Astute.logger.debug("Could not find controller! Possible adding a new node to the existing cluster?")
-        return
-      end
+      controller = get_controller(deployment_info)
+      return if controller.nil?
 
       os = {
         'os_tenant_name'    => Shellwords.escape("#{controller['access']['tenant']}"),
@@ -343,6 +378,13 @@ module Astute
                          else
                            raise CirrosError, "Unknown system #{controller['cobbler']['profile']}"
                        end
+
+      if use_mellanox
+        os['img_path']='/opt/vm/VM_CentOS6.4x64_img.qcow2'
+        os['img_name']='MlnxVM'
+        os['os_name']='CentOS6.4_mellanox'
+      end
+
       auth_params = "-N #{os['os_auth_url']} \
                      -T #{os['os_tenant_name']} \
                      -I #{os['os_username']} \
@@ -366,7 +408,7 @@ module Astute
               "
         response = run_shell_command(context, Array(controller['uid']), cmd)
         if response[:data][:exit_code] == 0
-          Astute.logger.info("#{context.task_id}: Upload cirros image is done")
+          Astute.logger.info("#{context.task_id}: Upload #{os['os_name']} image is done")
         else
           msg = 'Upload cirros image failed'
           Astute.logger.error("#{context.task_id}: #{msg}")
